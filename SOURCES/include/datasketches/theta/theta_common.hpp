@@ -48,8 +48,9 @@ class ThetaSketchAggregateFunctionFactory : public AggregateFunctionFactory {
     virtual void getIntermediateTypes(ServerInterface &srvInterface,
                                       const SizedColumnTypes &inputTypes,
                                       SizedColumnTypes &intermediateTypeMetaData) {
-        uint8_t logK = readLogK(srvInterface);
-        intermediateTypeMetaData.addVarbinary(quickSelectSketchMinSize(logK));
+        //uint8_t logK = readLogK(srvInterface);
+        //intermediateTypeMetaData.addVarbinary(quickSelectSketchMinSize(logK));
+        intermediateTypeMetaData.addInt();
     }
 
     virtual void getReturnType(ServerInterface &srvfloaterface,

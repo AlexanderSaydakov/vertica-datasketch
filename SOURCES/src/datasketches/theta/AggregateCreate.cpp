@@ -7,63 +7,76 @@
 using namespace Vertica;
 using namespace std;
 
+class ThetaSketchAggregateCreate : public AggregateFunction {
+ private:
+    uint8_t lg_k;
+    uint64_t seed;
 
-/**
- * User Defined Aggregate Function concatenate that takes in strings and concatenates
- * them together. Right now, the max length of the resulting string is ten times the
- * maximum length of the input string.
- */
-class ThetaSketchAggregateCreate : public ThetaSketchAggregateFunction {
+public:
+    void setup(ServerInterface &srvInterface, const SizedColumnTypes &argTypes) {
+        lg_k = readLogK(srvInterface);
+        seed = readSeed(srvInterface);
+    }
+
+   // use an update_theta_sketch as the state of the aggregation
+   // store a pointer in the IntermediateAggs
+   void initAggregate(ServerInterface &srvInterface, IntermediateAggs &aggs) {
+        try {
+            auto builder = update_theta_sketch_custom::builder().set_lg_k(lg_k).set_seed(seed);
+            aggs.getIntRef(0) = reinterpret_cast<uint64_t>(new update_theta_sketch_custom(builder.build()));
+        } catch (exception &e) {
+            vt_report_error(0, "Exception while initializing intermediate aggregates: [%s]", e.what());
+        }
+    }
+
     void aggregate(ServerInterface &srvInterface,
                    BlockReader &argReader,
                    IntermediateAggs &aggs) {
         try {
-            auto sketch = compact_theta_sketch_custom::deserialize(aggs.getStringRef(0).data(),
-                                                            aggs.getStringRef(0).length(),
-                                                            seed);
-            auto updater = update_theta_sketch_custom::builder().set_lg_k(logK).set_seed(seed).build();
+            auto sketch_ptr = reinterpret_cast<update_theta_sketch_custom*>(aggs.getIntRef(0));
             do {
-                updater.update(argReader.getStringRef(0).str());
+                sketch_ptr->update(argReader.getStringRef(0).str());
             } while (argReader.next());
-            // Merges previous sketch and new one AND rebuilds the result (private on update_theta_sketch)
-            auto u = theta_union_custom::builder().set_lg_k(logK).set_seed(seed).build();
-            u.update(updater.compact());
-            u.update(sketch);
-            auto data = u.get_result().serialize();
-            aggs.getStringRef(0).copy((char *) &data[0], data.size());
         } catch (exception &e) {
-            // Standard exception. Quit.
             vt_report_error(0, "Exception while processing aggregate: [%s]", e.what());
         }
     }
 
-    virtual void combine(ServerInterface &srvInterface,
-                         IntermediateAggs &aggs,
-                         MultipleIntermediateAggs &aggsOther) override {
+    // most probably, this will not work across different nodes
+    // since the aggregation state is not a part of IntermediateAggs object
+    void combine(ServerInterface &srvInterface,
+                 IntermediateAggs &aggs,
+                 MultipleIntermediateAggs &aggsOther) override {
         try {
-            auto u = theta_union_custom::builder()
-                    .set_lg_k(logK)
-                    .set_seed(seed)
-                    .build();
-
-            auto sketch = compact_theta_sketch_custom::deserialize(aggs.getStringRef(0).data(),
-                                                            aggs.getStringRef(0).length(),
-                                                            seed);
-            u.update(sketch);
-
+            auto u = theta_union_custom::builder().set_lg_k(lg_k).set_seed(seed).build();
+            auto sketch_ptr = reinterpret_cast<update_theta_sketch_custom*>(aggs.getIntRef(0));
+            u.update(*sketch_ptr);
             do {
-                sketch = compact_theta_sketch_custom::deserialize(aggsOther.getStringRef(0).data(),
-                                                           aggsOther.getStringRef(0).length(),
-                                                           seed);
-                u.update(sketch);
+                auto other_sketch_ptr = reinterpret_cast<update_theta_sketch_custom*>(aggsOther.getIntRef(0));
+                u.update(*other_sketch_ptr);
             } while (aggsOther.next());
-
-            auto data = u.get_result().serialize();
-            aggs.getStringRef(0).copy((char *)&data[0], data.size());
-
+            // replace the state: update_theta_sketch -> compact_theta_sketch
+            // it is impossible to have an update_theta_sketch as a result of combining
+            delete sketch_ptr;
+            aggs.getIntRef(0) = reinterpret_cast<uint64_t>(new compact_theta_sketch_custom(u.get_result()));
         } catch (exception &e) {
-            // Standard exception. Quit.
             vt_report_error(0, "Exception while combining intermediate aggregates: [%s]", e.what());
+        }
+    }
+
+    // this assumes that combine() is allways called (seems to be the case in limited testing)
+    // expects a compact_theta_sketch as a result of combine()
+    void terminate(ServerInterface &srvInterface,
+                   BlockWriter &resWriter,
+                   IntermediateAggs &aggs) override {
+        try {
+            auto sketch_ptr = reinterpret_cast<compact_theta_sketch_custom*>(aggs.getIntRef(0));
+            auto bytes = sketch_ptr->serialize();
+            delete sketch_ptr;
+            VString &result = resWriter.getStringRef();
+            result.copy(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        } catch (exception &e) {
+            vt_report_error(0, "Exception while computing aggregate output: [%s]", e.what());
         }
     }
 
